@@ -18,21 +18,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            artifact: mqtt-conformance
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            artifact: mqtt-conformance
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            artifact: mqtt-conformance
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            artifact: mqtt-conformance.exe
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p ~/.cargo
+          echo '[target.aarch64-unknown-linux-musl]' >> ~/.cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -42,26 +45,12 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Create archive (Unix)
-        if: runner.os != 'Windows'
+      - name: Create archive
         run: |
           cd target/${{ matrix.target }}/release
-          tar -czvf ../../../mqtt-conformance-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+          tar -czvf ../../../mqtt-conformance-${{ matrix.target }}.tar.gz mqtt-conformance
 
-      - name: Create archive (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../mqtt-conformance-${{ matrix.target }}.zip ${{ matrix.artifact }}
-
-      - name: Upload release asset (Unix)
-        if: runner.os != 'Windows'
+      - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
           files: mqtt-conformance-${{ matrix.target }}.tar.gz
-
-      - name: Upload release asset (Windows)
-        if: runner.os == 'Windows'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: mqtt-conformance-${{ matrix.target }}.zip
