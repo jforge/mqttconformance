@@ -70,7 +70,7 @@ pub enum Commands {
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
 pub enum MqttVersion {
     /// MQTT 3.1.1
-    #[value(name = "3.1.1", alias = "311")]
+    #[value(name = "3.1.1", aliases = ["3", "311"])]
     V311,
     /// MQTT 5.0
     #[value(name = "5", alias = "5.0")]
