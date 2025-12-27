@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: mqtt-conformance
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: mqtt-conformance
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: mqtt-conformance
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: mqtt-conformance.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Create archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czvf ../../../mqtt-conformance-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+
+      - name: Create archive (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../mqtt-conformance-${{ matrix.target }}.zip ${{ matrix.artifact }}
+
+      - name: Upload release asset (Unix)
+        if: runner.os != 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mqtt-conformance-${{ matrix.target }}.tar.gz
+
+      - name: Upload release asset (Windows)
+        if: runner.os == 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mqtt-conformance-${{ matrix.target }}.zip
