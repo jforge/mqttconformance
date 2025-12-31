@@ -341,14 +341,15 @@ fn test_mqtt_4_7_3_1(ctx: TestContext) -> Pin<Box<dyn Future<Output = Result<(),
             .map_err(|_| ConformanceError::Timeout("Waiting for CONNACK".to_string()))?
             .map_err(ConformanceError::Io)?;
 
-        // Send PUBLISH with wildcard in topic name
+        // Send PUBLISH with wildcard in topic name using QoS 1
+        // so we can detect if server accepts it (via PUBACK)
         let topic_with_wildcard = b"test/+/invalid";
         let payload = b"test";
         let mut publish_packet = Vec::new();
 
-        // PUBLISH with QoS 0
-        publish_packet.push(0x30);
-        let remaining = 2 + topic_with_wildcard.len() + payload.len();
+        // PUBLISH with QoS 1 (0x32 = 0011 0010: PUBLISH, QoS 1)
+        publish_packet.push(0x32);
+        let remaining = 2 + topic_with_wildcard.len() + 2 + payload.len(); // +2 for packet ID
         publish_packet.push(remaining as u8);
 
         // Topic
@@ -356,21 +357,30 @@ fn test_mqtt_4_7_3_1(ctx: TestContext) -> Pin<Box<dyn Future<Output = Result<(),
         publish_packet.push(topic_with_wildcard.len() as u8);
         publish_packet.extend_from_slice(topic_with_wildcard);
 
+        // Packet ID (required for QoS 1)
+        publish_packet.push(0x00);
+        publish_packet.push(0x01);
+
         // Payload
         publish_packet.extend_from_slice(payload);
 
         stream.write_all(&publish_packet).await
             .map_err(ConformanceError::Io)?;
 
-        // Server should either close connection or silently ignore
-        // The spec says Topic Names MUST NOT contain wildcards, but doesn't specify
-        // exact server behavior. Either closing or ignoring is acceptable.
+        // Server should reject - either close connection or not send PUBACK
+        // If we get a PUBACK, the server incorrectly accepted the wildcard topic
         let mut response_buf = [0u8; 4];
         match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut response_buf)).await {
-            Ok(Ok(0)) => Ok(()), // Connection closed - acceptable
-            Ok(Ok(_)) => Ok(()), // Some response - might be OK
-            Ok(Err(_)) => Ok(()), // Connection error - acceptable
-            Err(_) => Ok(()), // Timeout - server may have silently ignored
+            Ok(Ok(0)) => Ok(()), // Connection closed - correct rejection
+            Ok(Err(_)) => Ok(()), // Connection error/RST - correct rejection
+            Ok(Ok(n)) if n >= 1 && response_buf[0] == 0x40 => {
+                // 0x40 = PUBACK - server incorrectly accepted wildcard topic
+                Err(ConformanceError::ProtocolViolation(
+                    "Server sent PUBACK for PUBLISH with wildcard in topic name".to_string()
+                ))
+            }
+            Ok(Ok(_)) => Ok(()), // Some other response - might be disconnect
+            Err(_) => Ok(()), // Timeout without PUBACK - server dropped it (acceptable)
         }
     })
 }

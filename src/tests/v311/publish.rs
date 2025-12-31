@@ -781,64 +781,151 @@ fn test_mqtt_3_3_2_1(ctx: TestContext) -> Pin<Box<dyn Future<Output = Result<(),
 }
 
 /// MQTT-3.3.2-2: Topic Name MUST NOT contain wildcard characters
+/// Tests both directions:
+/// 1. Client→Server: Server should reject PUBLISH with wildcard in topic
+/// 2. Server→Client: Delivered topic must match published topic, not subscription filter
 fn test_mqtt_3_3_2_2(ctx: TestContext) -> Pin<Box<dyn Future<Output = Result<(), ConformanceError>> + Send>> {
     Box::pin(async move {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpStream;
+        // Part 1: Test server→client direction
+        // Subscribe with wildcard, publish to matching topic, verify delivered topic
+        // is the actual topic (not the wildcard pattern) and contains no wildcards
+        {
+            let base = uuid::Uuid::new_v4();
+            let wildcard_filter = format!("test/{}/+/data", base);
+            let actual_topic = format!("test/{}/sensor/data", base);
+            let payload = b"test message";
 
-        let mut stream = TcpStream::connect(format!("{}:{}", ctx.host, ctx.port))
-            .await
-            .map_err(|e| ConformanceError::Connection(e.to_string()))?;
+            let mut opts = MqttOptions::new(
+                format!("test3322a{}", &uuid::Uuid::new_v4().to_string()[..8]),
+                &ctx.host,
+                ctx.port,
+            );
+            opts.set_keep_alive(Duration::from_secs(30));
+            opts.set_clean_session(true);
 
-        // Connect
-        let client_id = format!("test3322{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let connect_packet = build_connect_packet(&client_id, 30);
-        stream.write_all(&connect_packet).await
-            .map_err(ConformanceError::Io)?;
+            let (client, mut eventloop) = AsyncClient::new(opts, 10);
 
-        let mut buf = [0u8; 4];
-        tokio::time::timeout(ctx.timeout, stream.read_exact(&mut buf)).await
-            .map_err(|_| ConformanceError::Timeout("Waiting for CONNACK".to_string()))?
-            .map_err(ConformanceError::Io)?;
-
-        // Send PUBLISH with wildcard in topic name (should be rejected)
-        let topic_with_wildcard = b"test/+/invalid";
-        let payload = b"test";
-        let mut publish_packet = Vec::new();
-
-        // Fixed header: PUBLISH with QoS=1
-        publish_packet.push(0x32);
-        let remaining = 2 + topic_with_wildcard.len() + 2 + payload.len();
-        publish_packet.push(remaining as u8);
-
-        // Topic with wildcard
-        publish_packet.push(0x00);
-        publish_packet.push(topic_with_wildcard.len() as u8);
-        publish_packet.extend_from_slice(topic_with_wildcard);
-
-        // Packet ID
-        publish_packet.push(0x00);
-        publish_packet.push(0x01);
-
-        // Payload
-        publish_packet.extend_from_slice(payload);
-
-        stream.write_all(&publish_packet).await
-            .map_err(ConformanceError::Io)?;
-
-        // Server should either close connection or not deliver the message
-        // For now, we accept either behavior as the spec says MUST NOT contain wildcards
-        // but doesn't specify server behavior
-        let mut response_buf = [0u8; 4];
-        match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut response_buf)).await {
-            Ok(Ok(0)) => Ok(()), // Connection closed - correct
-            Ok(Ok(_)) => {
-                // Got some response - might be PUBACK or disconnect
-                Ok(())
+            // Wait for CONNACK
+            loop {
+                match tokio::time::timeout(ctx.timeout, eventloop.poll()).await {
+                    Ok(Ok(Event::Incoming(Packet::ConnAck(_)))) => break,
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(e)) => return Err(ConformanceError::MqttConnection(e)),
+                    Err(_) => return Err(ConformanceError::Timeout("Waiting for CONNACK".to_string())),
+                }
             }
-            Ok(Err(_)) => Ok(()), // Connection error - correct
-            Err(_) => Ok(()), // Timeout - server may have silently ignored
+
+            // Subscribe with wildcard filter
+            client.subscribe(&wildcard_filter, QoS::AtLeastOnce).await
+                .map_err(ConformanceError::MqttClient)?;
+
+            loop {
+                match tokio::time::timeout(ctx.timeout, eventloop.poll()).await {
+                    Ok(Ok(Event::Incoming(Packet::SubAck(_)))) => break,
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(e)) => return Err(ConformanceError::MqttConnection(e)),
+                    Err(_) => return Err(ConformanceError::Timeout("Waiting for SUBACK".to_string())),
+                }
+            }
+
+            // Publish to actual topic (no wildcards)
+            client.publish(&actual_topic, QoS::AtLeastOnce, false, payload.to_vec()).await
+                .map_err(ConformanceError::MqttClient)?;
+
+            // Wait for the message - verify topic is actual_topic, not wildcard_filter
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(3) {
+                match tokio::time::timeout(Duration::from_millis(500), eventloop.poll()).await {
+                    Ok(Ok(Event::Incoming(Packet::Publish(publish)))) => {
+                        // Check topic contains no wildcards
+                        if publish.topic.contains('+') || publish.topic.contains('#') {
+                            client.disconnect().await.ok();
+                            return Err(ConformanceError::ProtocolViolation(format!(
+                                "Server delivered PUBLISH with wildcard in topic: '{}'",
+                                publish.topic
+                            )));
+                        }
+                        // Check topic matches what we published, not the subscription filter
+                        if publish.topic != actual_topic {
+                            client.disconnect().await.ok();
+                            return Err(ConformanceError::ProtocolViolation(format!(
+                                "Server delivered wrong topic. Expected '{}', got '{}'",
+                                actual_topic, publish.topic
+                            )));
+                        }
+                        client.disconnect().await.ok();
+                        break;
+                    }
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(_)) => break,
+                    Err(_) => continue,
+                }
+            }
         }
+
+        // Part 2: Test client→server direction
+        // Server should reject PUBLISH with wildcard in topic name
+        {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpStream;
+
+            let mut stream = TcpStream::connect(format!("{}:{}", ctx.host, ctx.port))
+                .await
+                .map_err(|e| ConformanceError::Connection(e.to_string()))?;
+
+            // Connect
+            let client_id = format!("test3322b{}", &uuid::Uuid::new_v4().to_string()[..8]);
+            let connect_packet = build_connect_packet(&client_id, 30);
+            stream.write_all(&connect_packet).await
+                .map_err(ConformanceError::Io)?;
+
+            let mut buf = [0u8; 4];
+            tokio::time::timeout(ctx.timeout, stream.read_exact(&mut buf)).await
+                .map_err(|_| ConformanceError::Timeout("Waiting for CONNACK".to_string()))?
+                .map_err(ConformanceError::Io)?;
+
+            // Send PUBLISH with wildcard in topic name (should be rejected)
+            let topic_with_wildcard = b"test/+/invalid";
+            let payload = b"test";
+            let mut publish_packet = Vec::new();
+
+            // Fixed header: PUBLISH with QoS=1
+            publish_packet.push(0x32);
+            let remaining = 2 + topic_with_wildcard.len() + 2 + payload.len();
+            publish_packet.push(remaining as u8);
+
+            // Topic with wildcard
+            publish_packet.push(0x00);
+            publish_packet.push(topic_with_wildcard.len() as u8);
+            publish_packet.extend_from_slice(topic_with_wildcard);
+
+            // Packet ID
+            publish_packet.push(0x00);
+            publish_packet.push(0x01);
+
+            // Payload
+            publish_packet.extend_from_slice(payload);
+
+            stream.write_all(&publish_packet).await
+                .map_err(ConformanceError::Io)?;
+
+            // Server should reject - either close connection or not send PUBACK
+            let mut response_buf = [0u8; 4];
+            match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut response_buf)).await {
+                Ok(Ok(0)) => {} // Connection closed - correct
+                Ok(Err(_)) => {} // Connection error/RST - correct
+                Ok(Ok(n)) if n >= 1 && response_buf[0] == 0x40 => {
+                    // 0x40 = PUBACK - server incorrectly accepted wildcard topic
+                    return Err(ConformanceError::ProtocolViolation(
+                        "Server sent PUBACK for PUBLISH with wildcard in topic name".to_string()
+                    ));
+                }
+                Ok(Ok(_)) => {} // Some other response
+                Err(_) => {} // Timeout without PUBACK - server dropped it (acceptable)
+            }
+        }
+
+        Ok(())
     })
 }
 

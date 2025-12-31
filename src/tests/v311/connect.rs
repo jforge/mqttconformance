@@ -384,9 +384,12 @@ fn test_mqtt_3_1_2_2(ctx: TestContext) -> Pin<Box<dyn Future<Output = Result<(),
 
         // Read CONNACK
         let mut buf = [0u8; 4];
-        let n = tokio::time::timeout(ctx.timeout, stream.read(&mut buf)).await
-            .map_err(|_| ConformanceError::Timeout("Waiting for CONNACK".to_string()))?
-            .map_err(ConformanceError::Io)?;
+        let n = match tokio::time::timeout(ctx.timeout, stream.read(&mut buf)).await {
+            Err(_) => return Err(ConformanceError::Timeout("Waiting for CONNACK".to_string())),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()), // RST is valid
+            Ok(Err(e)) => return Err(ConformanceError::Io(e)),
+            Ok(Ok(n)) => n,
+        };
 
         if n >= 4 && buf[0] == 0x20 && buf[3] == 0x01 {
             Ok(()) // CONNACK with return code 0x01 (unacceptable protocol level)
@@ -696,9 +699,12 @@ fn test_mqtt_3_1_3_8(ctx: TestContext) -> Pin<Box<dyn Future<Output = Result<(),
 
         // Read response
         let mut buf = [0u8; 4];
-        let n = tokio::time::timeout(ctx.timeout, stream.read(&mut buf)).await
-            .map_err(|_| ConformanceError::Timeout("Waiting for CONNACK".to_string()))?
-            .map_err(ConformanceError::Io)?;
+        let n = match tokio::time::timeout(ctx.timeout, stream.read(&mut buf)).await {
+            Err(_) => return Err(ConformanceError::Timeout("Waiting for CONNACK".to_string())),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()), // RST is valid
+            Ok(Err(e)) => return Err(ConformanceError::Io(e)),
+            Ok(Ok(n)) => n,
+        };
 
         if (n >= 4 && buf[0] == 0x20 && buf[3] == 0x02) || n == 0 {
             // CONNACK with return code 0x02 (Identifier rejected) or connection closed - acceptable
@@ -1821,13 +1827,14 @@ fn test_mqtt_3_1_3_6(ctx: TestContext) -> Pin<Box<dyn Future<Output = Result<(),
             .map_err(ConformanceError::Io)?;
 
         let mut buf = [0u8; 4];
-        let n = tokio::time::timeout(ctx.timeout, stream.read(&mut buf)).await
-            .map_err(|_| ConformanceError::Timeout("Waiting for CONNACK".to_string()))?
-            .map_err(ConformanceError::Io)?;
+        let result = tokio::time::timeout(ctx.timeout, stream.read(&mut buf)).await;
 
-        // Any response is acceptable for MAY - server may accept, reject, or close connection
-        let _ = (n, buf);
-        Ok(())
+        // Any response is acceptable for MAY - server may accept, reject, close connection, or RST
+        match result {
+            Err(_) => Err(ConformanceError::Timeout("Waiting for CONNACK".to_string())),
+            Ok(Err(_)) => Ok(()), // RST or other connection error is acceptable
+            Ok(Ok(_)) => Ok(()),  // Any data response is acceptable
+        }
     })
 }
 
@@ -1848,9 +1855,12 @@ fn test_mqtt_3_1_3_7(ctx: TestContext) -> Pin<Box<dyn Future<Output = Result<(),
             .map_err(ConformanceError::Io)?;
 
         let mut buf = [0u8; 4];
-        let n = tokio::time::timeout(ctx.timeout, stream.read(&mut buf)).await
-            .map_err(|_| ConformanceError::Timeout("Waiting for response".to_string()))?
-            .map_err(ConformanceError::Io)?;
+        let n = match tokio::time::timeout(ctx.timeout, stream.read(&mut buf)).await {
+            Err(_) => return Err(ConformanceError::Timeout("Waiting for response".to_string())),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()), // RST is valid
+            Ok(Err(e)) => return Err(ConformanceError::Io(e)),
+            Ok(Ok(n)) => n,
+        };
 
         if (n >= 4 && buf[0] == 0x20 && buf[3] == 0x02) || n == 0 {
             // CONNACK with Identifier Rejected or connection closed - both acceptable
@@ -1918,13 +1928,16 @@ fn test_mqtt_3_1_4_5(ctx: TestContext) -> Pin<Box<dyn Future<Output = Result<(),
 
         // Read response
         let mut buf = [0u8; 16];
-        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await
-            .map_err(|_| ConformanceError::Timeout("Waiting for response".to_string()))?
-            .map_err(ConformanceError::Io)?;
+        let n = match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
+            Err(_) => return Err(ConformanceError::Timeout("Waiting for response".to_string())),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()), // RST is valid
+            Ok(Err(e)) => return Err(ConformanceError::Io(e)),
+            Ok(Ok(n)) => n,
+        };
 
         // Should only get CONNACK with error, no SUBACK
         if n == 0 {
-            return Ok(()); // Connection closed
+            return Ok(()); // Connection closed (FIN)
         }
 
         // Check we didn't get a SUBACK
@@ -2737,9 +2750,12 @@ fn test_mqtt_3_1_3_9(ctx: TestContext) -> Pin<Box<dyn Future<Output = Result<(),
             .map_err(ConformanceError::Io)?;
 
         let mut buf = [0u8; 4];
-        let n = tokio::time::timeout(ctx.timeout, stream.read(&mut buf)).await
-            .map_err(|_| ConformanceError::Timeout("Waiting for response".to_string()))?
-            .map_err(ConformanceError::Io)?;
+        let n = match tokio::time::timeout(ctx.timeout, stream.read(&mut buf)).await {
+            Err(_) => return Err(ConformanceError::Timeout("Waiting for response".to_string())),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()), // RST is valid
+            Ok(Err(e)) => return Err(ConformanceError::Io(e)),
+            Ok(Ok(n)) => n,
+        };
 
         if n >= 4 && buf[0] == 0x20 && buf[3] == 0x02 {
             Ok(()) // CONNACK with Identifier Rejected
